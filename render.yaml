@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: startup-studio
+    runtime: docker
+    plan: free
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: COMINTY_API_KEY
+        sync: false
+      - key: COMINTY_USER_ID
+        sync: false
+      - key: COMINTY_BASE_URL
+        sync: false
