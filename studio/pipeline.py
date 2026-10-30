@@ -3,9 +3,16 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
-from cominty_sdk import AsyncCominty, ComintyError, events
+from cominty_sdk import (
+    APIConnectionError,
+    AsyncCominty,
+    ComintyError,
+    RateLimitError,
+    ServerError,
+    events,
+)
 
 from studio.agents import RESEARCHER, TEAM
 from studio.config import settings
@@ -37,6 +44,20 @@ def describe(event: events.AnyEvent) -> tuple[EventKind, str]:
     return "step", event.name.replace("_", " ")
 
 
+_TRANSIENT = (APIConnectionError, RateLimitError, ServerError)
+
+
+async def _retry[T](call: Callable[[], Awaitable[T]], attempts: int = 3) -> T:
+    # Only for idempotent reads (download, export). Never wrap chat.start: a retry there
+    # would open a second thread and repeat the agent's side effects (Linear issues).
+    for attempt in range(1, attempts):
+        try:
+            return await call()
+        except _TRANSIENT:
+            await asyncio.sleep(2**attempt)
+    return await call()
+
+
 async def _run_agent(
     client: AsyncCominty, agent: Agent, idea: str, tone: Tone, research: str, on_update: OnUpdate
 ) -> str | None:
@@ -53,17 +74,28 @@ async def _run_agent(
         message = await started.result()
         if message.status != "success":
             raise AgentFailed(agent.key, message.error_code or message.status)
-        names = [(f.name, f.mimetype) for f in message.files]
-        fetches = [client.chat.download_file(f.id) for f in message.files]
+        downloads = asyncio.gather(
+            *(_retry(lambda f=f: client.chat.download_file(f.id)) for f in message.files)
+        )
         if agent.export_pdf:
-            names.append((agent.export_pdf, "application/pdf"))
-            fetches.append(client.chat.export(message.id, format="pdf"))
-        blobs = await asyncio.gather(*fetches)
+            export = _retry(lambda: client.chat.export(message.id, format="pdf"))
+            blobs, pdf = await asyncio.gather(downloads, export, return_exceptions=True)
+        else:
+            blobs, pdf = await downloads, None
+        if isinstance(blobs, BaseException):
+            raise blobs
     except (ComintyError, AgentFailed) as exc:
         on_update(AgentResult(agent.key, False, str(exc), time.monotonic() - started_at))
         return None
     text = clean(message.content)
-    outputs = [Output(name, mime, data) for (name, mime), data in zip(names, blobs, strict=True)]
+    outputs = [
+        Output(f.name, f.mimetype, data) for f, data in zip(message.files, blobs, strict=True)
+    ]
+    if isinstance(pdf, bytes):
+        outputs.append(Output(agent.export_pdf or "", "application/pdf", pdf))
+    elif pdf is not None:
+        # The reply itself succeeded: keep it and the other files, flag only the PDF.
+        text += f"\n\n_PDF export failed: {pdf}_"
     on_update(AgentResult(agent.key, True, text, time.monotonic() - started_at, outputs))
     return text
 
@@ -73,6 +105,7 @@ async def run_studio(idea: str, tone: Tone, on_update: OnUpdate) -> None:
         api_token=settings.cominty_api_key,
         user_id=settings.cominty_user_id,
         base_url=settings.cominty_base_url,
+        timeout=settings.cominty_timeout,
     ) as client:
         research = await _run_agent(client, RESEARCHER, idea, tone, "", on_update)
         if research is None:

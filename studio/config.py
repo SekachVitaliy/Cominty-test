@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     cominty_user_id: str
     cominty_base_url: str | None = None
     cominty_agent_id: str = "__cominty_agents::agent.chat"
+    cominty_timeout: float = 180  # seconds; the SDK default of 60 is too short for PDF export
     runs_dir: Path = ROOT / "runs"
     skills_dir: Path = ROOT / "skills"
 
